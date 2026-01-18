@@ -1,0 +1,266 @@
+#include <WiFiS3.h>
+#include <ArduinoBLE.h>
+#include <math.h>
+
+const char* WIFI_SSID = "";
+const char* WIFI_PASS = "";
+const char* THINGSPEAK_HOST = "api.thingspeak.com";
+String THINGSPEAK_WRITE_KEY = "";
+
+
+const int PIN_TILT = 2;
+const int PIN_VIB  = 3;
+const int PIN_TRIG = 5;
+const int PIN_ECHO = 6;
+
+
+const float GROUND_CM = 25.0;
+const unsigned long EVENT_COOLDOWN_MS = 3000;
+const unsigned long TS_MIN_INTERVAL_MS = 16000;
+
+WiFiClient client;
+
+
+BLEService fallService("19B10000-E8F2-537E-4F6C-D104768A1214");
+
+BLEByteCharacteristic aiLabelChar(
+  "19B10001-E8F2-537E-4F6C-D104768A1214",
+  BLERead | BLENotify
+);
+
+
+BLEUnsignedCharCharacteristic aiConfChar(
+  "19B10002-E8F2-537E-4F6C-D104768A1214",
+  BLERead | BLENotify
+);
+
+
+BLEUnsignedIntCharacteristic distX10Char(
+  "19B10003-E8F2-537E-4F6C-D104768A1214",
+  BLERead | BLENotify
+);
+
+
+struct AIResult {
+  int label;
+  int confidence;
+};
+
+float sigmoid(float x) {
+  return 1.0f / (1.0f + exp(-x));
+}
+
+const char* labelToText(int label) {
+  switch (label) {
+    case 0: return "NORMAL";
+    case 1: return "BUMP";
+    case 2: return "FALL";
+    default: return "UNKNOWN";
+  }
+}
+
+
+AIResult runEdgeAI(int tilt, int vib, float distCM) {
+  float nearGround = (distCM > 0 && distCM <= GROUND_CM) ? 1.0f : 0.0f;
+
+
+  if (nearGround < 0.5f) {
+    float scoreBump = (-1.2f) + 2.6f * vib + 0.6f * tilt;
+    float pBump = sigmoid(scoreBump);
+
+    AIResult r;
+    if (pBump > 0.70f) {
+      r.label = 1;
+      r.confidence = constrain((int)(pBump * 100.0f), 0, 100);
+    } else {
+      r.label = 0;
+      r.confidence = constrain((int)((1.0f - pBump) * 100.0f), 0, 100);
+    }
+    return r;
+  }
+
+
+  float scoreFall = (-1.6f) + 2.4f * vib + 1.6f * tilt + 2.2f * nearGround;
+  float scoreBump = (-1.2f) + 2.6f * vib + 0.6f * tilt;
+
+  float pFall = sigmoid(scoreFall);
+  float pBump = sigmoid(scoreBump);
+
+  AIResult r;
+  float p;
+
+  if (pFall > 0.70f) {
+    r.label = 2;
+    p = pFall;
+  } else if (pBump > 0.70f) {
+    r.label = 1;
+    p = pBump;
+  } else {
+    r.label = 0;
+    p = 1.0f - max(pBump, pFall);
+  }
+
+  r.confidence = constrain((int)(p * 100.0f), 0, 100);
+  return r;
+}
+
+
+float readDistanceCM() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  unsigned long duration = pulseIn(PIN_ECHO, HIGH, 30000UL);
+  if (duration == 0) return -1.0f;
+
+  return (duration * 0.0343f) / 2.0f;
+}
+
+float averageDistance3() {
+  float d1 = readDistanceCM(); delay(60);
+  float d2 = readDistanceCM(); delay(60);
+  float d3 = readDistanceCM();
+
+  float sum = 0.0f;
+  int n = 0;
+
+  if (d1 > 0) { sum += d1; n++; }
+  if (d2 > 0) { sum += d2; n++; }
+  if (d3 > 0) { sum += d3; n++; }
+
+  if (n == 0) return -1.0f;
+  return sum / (float)n;
+}
+
+void connectWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    delay(1500);
+    Serial.print(".");
+  }
+
+  Serial.println("\n✅ WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+bool sendToThingSpeak(int tilt, int vib, float distCM, int label, int conf) {
+  String url = "/update?api_key=" + THINGSPEAK_WRITE_KEY +
+               "&field1=" + String(tilt) +
+               "&field2=" + String(vib) +
+               "&field3=" + String(distCM, 1) +
+               "&field4=" + String(label) +
+               "&field5=" + String(conf);
+
+  if (!client.connect(THINGSPEAK_HOST, 80)) {
+    Serial.println("❌ ThingSpeak connection failed");
+    return false;
+  }
+
+  client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+               "Host: " + THINGSPEAK_HOST + "\r\n" +
+               "Connection: close\r\n\r\n");
+
+  unsigned long t0 = millis();
+  while (client.connected() && millis() - t0 < 2000) {
+    while (client.available()) client.read();
+  }
+  client.stop();
+
+  Serial.println("✅ ThingSpeak upload done");
+  return true;
+}
+
+void setupBLE() {
+  if (!BLE.begin()) {
+    Serial.println("❌ BLE.begin() failed");
+    return;
+  }
+
+  BLE.setLocalName("FALL-DETECTOR");
+  BLE.setAdvertisedService(fallService);
+
+  fallService.addCharacteristic(aiLabelChar);
+  fallService.addCharacteristic(aiConfChar);
+  fallService.addCharacteristic(distX10Char);
+
+  BLE.addService(fallService);
+
+  aiLabelChar.writeValue((byte)0);
+  aiConfChar.writeValue((byte)0);
+  distX10Char.writeValue((unsigned int)0);
+
+  BLE.advertise();
+  Serial.println("✅ BLE advertising: FALL-DETECTOR");
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(PIN_TILT, INPUT);
+  pinMode(PIN_VIB, INPUT);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+
+  connectWiFi();
+  setupBLE();
+
+  Serial.println("\nSystem ready (Event-driven + BLE M2M + Edge AI + ThingSpeak)");
+  Serial.println("Legend: label 0=NORMAL, 1=BUMP, 2=FALL\n");
+}
+
+void loop() {
+  BLE.poll();
+
+  static int lastVib = 0;
+  static unsigned long lastEventMs = 0;
+  static unsigned long lastTSms = 0;
+
+  int vib = digitalRead(PIN_VIB);
+  unsigned long now = millis();
+
+  bool vibRisingEdge = (vib == 1 && lastVib == 0);
+
+  if (vibRisingEdge && (now - lastEventMs > EVENT_COOLDOWN_MS)) {
+    lastEventMs = now;
+
+    int tilt = digitalRead(PIN_TILT);
+    float dist = averageDistance3();
+
+    AIResult ai = runEdgeAI(tilt, 1, dist);
+
+  
+    aiLabelChar.writeValue((byte)ai.label);
+    aiConfChar.writeValue((byte)ai.confidence);
+    unsigned int distX10 = (dist > 0) ? (unsigned int)(dist * 10.0f) : 0;
+    distX10Char.writeValue(distX10);
+
+  
+    Serial.println("----- EDGE AI RESULT -----");
+    Serial.print("Tilt: "); Serial.println(tilt);
+    Serial.print("Vibration: "); Serial.println(1);
+    Serial.print("Distance (cm): "); Serial.println(dist, 1);
+    Serial.print("AI Label: "); Serial.print(ai.label);
+    Serial.print(" ("); Serial.print(labelToText(ai.label)); Serial.println(")");
+    Serial.print("Confidence: "); Serial.print(ai.confidence); Serial.println(" %");
+    Serial.println("--------------------------\n");
+
+  
+    if (now - lastTSms >= TS_MIN_INTERVAL_MS) {
+      sendToThingSpeak(tilt, 1, dist, ai.label, ai.confidence);
+      lastTSms = now;
+    } else {
+      Serial.println("⚠️ ThingSpeak rate limit: upload skipped.\n");
+    }
+  }
+
+  lastVib = vib;
+  delay(20);
+}
